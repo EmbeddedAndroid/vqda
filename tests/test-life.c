@@ -335,6 +335,33 @@ static void test_session_close(void)
 	expect("session close frees its buffers", live_objects() == 0 && grants == 0);
 }
 
+static void test_grant_heap(int a, int b)
+{
+	struct dma_heap_allocation_data d = { .len = 1 << 20 };
+	int heap = open("/dev/dma_heap/system", O_RDWR), c0;
+	long g0 = grants;
+	uint32_t ha, hb;
+	char *p;
+
+	expect("grant heap alloc", heap >= 0 && !ioctl(heap, DMA_HEAP_IOCTL_ALLOC, &d));
+	p = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE, MAP_SHARED, d.fd, 0);
+	expect("heap buffer maps", p != MAP_FAILED);
+	p[9] = 9;
+	munmap(p, 1 << 20);
+	ha = import(a, d.fd);
+	hb = import(b, d.fd);
+	expect("imports into two sessions", ha && hb && import(a, d.fd) == ha);
+	close(d.fd);
+	p = map(b, hb, 1 << 20);
+	expect("imports outlive the heap fd", p && p[9] == 9 && grants >= 256);
+	munmap(p, 1 << 20);
+	c0 = host_closes;
+	gem_close(a, ha);
+	gem_close(b, hb);
+	expect("last import frees the grants", host_closes == c0 + 2 && grants == g0);
+	close(heap);
+}
+
 int main(void)
 {
 	pthread_t t;
@@ -361,6 +388,7 @@ int main(void)
 	test_prime_pin(a);
 	test_small_export(a);
 	test_copy(a, b);
+	test_grant_heap(a, b);
 	close(a);
 	close(b);
 	test_session_close();

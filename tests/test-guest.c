@@ -17,6 +17,8 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <linux/dma-heap.h>
+
 int vqda_sid(int fd);
 
 static int fails, xen;
@@ -37,6 +39,7 @@ static void expect_nb(const char *what, int ok)
 
 int main(int argc, char **argv)
 {
+	struct dma_heap_allocation_data a = { 0 };
 	int fd, p[2], n = -1;
 	char c;
 	void *m;
@@ -68,5 +71,21 @@ int main(int argc, char **argv)
 	fd = open("/dev/accel/accel9", O_RDWR);
 	expect("accel past the DSP list is not ours", fd == -1 && errno != ENODEV);
 
+	setenv("VQDA_DSPS", "cdsp", 1);
+	fd = open("/dev/dma_heap/system", O_RDWR);
+	expect("dma heap of a vqda guest is ours", fd >= 0);
+	a.len = 0;
+	expect("heap alloc of 0 bytes", ioctl(fd, DMA_HEAP_IOCTL_ALLOC, &a) == -1 &&
+	       errno == EINVAL);
+	a.len = 1ull << 44;
+	expect("heap alloc past the grant limit", ioctl(fd, DMA_HEAP_IOCTL_ALLOC, &a) == -1 &&
+	       errno == E2BIG);
+	a.len = 4096;
+	if (!xen)
+		expect("heap alloc without a back end", ioctl(fd, DMA_HEAP_IOCTL_ALLOC, &a) == -1 &&
+		       errno == ENODEV);
+	else
+		expect_nb("heap alloc without a back end", 0);
+	expect("heap fd closes", !close(fd));
 	return fails ? 1 : 0;
 }

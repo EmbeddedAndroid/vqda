@@ -26,6 +26,15 @@
  * that session. The FastRPC library then allocates device independent
  * buffers, mapped only into the context banks of the sessions using them.
  *
+ * Without a heap (a guest a toolstack creates) /dev/dma_heap/system is
+ * served from grants: DMA_HEAP_IOCTL_ALLOC grants the pages and returns a
+ * local fd that mmap maps from gntalloc; the back end sees the buffer only
+ * when a session imports it (PRIME), as a GEM_CREATE of those grants into
+ * that session, so it takes room only in the banks of the sessions using
+ * it. Created on the default device instead, every buffer would be mapped
+ * into that device's context bank whichever DSP uses it, and the buffers
+ * of a model split over several DSPs can fill that one bank.
+ *
  * Limit: the fds this library hands out (accel, PRIME, heap buffers) are
  * tracked by number and dup, dup2, dup3, F_DUPFD and close_range are not
  * intercepted. A duplicate is not one of ours, and replacing or closing
@@ -76,6 +85,7 @@ struct buf {
 	uint64_t size, index;
 	void *va;
 	int alias;		/* shares another entry's grants: never ungrant */
+	int gfd;		/* imported grant heap buffer: its local fd + 1 */
 	int heap;		/* a heap buffer: no grants, mapped from shm at index */
 	int pooled;		/* closed by the caller, kept for reuse */
 	int exported;		/* PRIME exported: other sessions may use it */
@@ -112,6 +122,17 @@ struct hfd {
 };
 static struct hfd hfds[MAX_FD];
 static char heap_dev[MAX_FD];	/* fds standing for /dev/dma_heap/system */
+#define HEAP_DEV_GRANTS	2	/* heap_dev value: served from grants */
+/* grant heap buffers: the fd's own reference plus one per session import */
+struct gfd {
+	int refs;
+	int held;		/* a dup this library holds after the caller closed */
+	uint32_t npages;
+	uint64_t size, index;
+	void *va;
+	uint32_t *grefs;
+};
+static struct gfd gfds[MAX_FD];
 /* one buffer's refs fit in VQDA_MAX_LIST granted list pages */
 #define MAX_GRANT_BYTES ((uint64_t)VQDA_MAX_LIST * VQDA_REFS_PER_PAGE * PAGE)
 static int shm = -1;		/* /dev/xen-shm/<heap> */
@@ -548,8 +569,20 @@ static int open_heap(void)
 	char p[96];
 	int fd;
 
-	if (!h)
-		return -2;	/* not ours: no heap configured */
+	if (!h) {
+		/* a vqda guest without a heap: serve the heap from grants */
+		if (!getenv("VQDA_DSPS") && !conf_dsps())
+			return -2;	/* not ours */
+		fd = eventfd(0, EFD_CLOEXEC);
+		if (fd >= MAX_FD) {
+			real_close(fd);
+			errno = EMFILE;
+			return -1;
+		}
+		if (fd >= 0)
+			heap_dev[fd] = HEAP_DEV_GRANTS;
+		return fd;
+	}
 	pthread_mutex_lock(&up_lock);
 	if (shm < 0) {
 		snprintf(p, sizeof(p), "/dev/xen-shm/%s", h);
@@ -595,6 +628,65 @@ static int heap_alloc(struct dma_heap_allocation_data *a)
 	hfds[fd].used = 1;
 	a->fd = fd;
 	return 0;
+}
+
+static int gheap_alloc(struct dma_heap_allocation_data *a)
+{
+	uint32_t npages, *refs;
+	uint64_t index;
+	void *va;
+	int fd, ret;
+
+	if (!a->len)
+		return -EINVAL;
+	if (a->len > MAX_GRANT_BYTES)
+		return -E2BIG;
+	npages = (a->len + PAGE - 1) / PAGE;
+	ret = ensure_up();
+	if (ret)
+		return ret;
+	refs = calloc(npages, sizeof(uint32_t));
+	if (!refs)
+		return -ENOMEM;
+	ret = grant(npages, &index, refs, &va);
+	if (ret) {
+		free(refs);
+		return ret;
+	}
+	fd = eventfd(0, EFD_CLOEXEC);
+	if (fd < 0 || fd >= MAX_FD) {
+		if (fd >= 0)
+			real_close(fd);
+		ungrant(va, npages, index);
+		free(refs);
+		return -EMFILE;
+	}
+	pthread_mutex_lock(&lock);
+	gfds[fd] = (struct gfd){ .refs = 1, .npages = npages, .size = a->len,
+				 .index = index, .va = va, .grefs = refs };
+	pthread_mutex_unlock(&lock);
+	a->fd = fd;
+	return 0;
+}
+
+/* Drop a reference with lock held; the last one moves the entry to @g. */
+static void gfd_unref_locked(int fd, struct gfd *g)
+{
+	if (gfds[fd].refs && !--gfds[fd].refs) {
+		*g = gfds[fd];
+		memset(&gfds[fd], 0, sizeof(gfds[fd]));
+	}
+}
+
+/* Free what gfd_unref_locked() moved out, without the lock. */
+static void gfd_release(int fd, struct gfd *g)
+{
+	if (g->va) {
+		ungrant(g->va, g->npages, g->index);
+		free(g->grefs);
+	}
+	if (g->held)
+		real_close(fd);
 }
 
 static int ours(const char *path, char *dsp)
@@ -844,10 +936,13 @@ fail:
 static void drop_buf(struct buf *b)
 {
 	struct buf me, *o, gone = { 0 };
-	int owns;
+	struct gfd gg = { 0 };
+	int g, owns;
 
+	/* close() may move the grant heap entry: read and drop it at once */
 	pthread_mutex_lock(&lock);
 	me = *b;
+	g = b->gfd;
 	owns = !b->alias && !b->heap;
 	if (owns && b->users) {
 		b->handle = 0;
@@ -862,11 +957,15 @@ static void drop_buf(struct buf *b)
 		gone = *o;
 		memset(o, 0, sizeof(*o));
 	}
+	if (g)
+		gfd_unref_locked(g - 1, &gg);
 	pthread_mutex_unlock(&lock);
 	if (owns)
 		ungrant(me.va, (me.size + PAGE - 1) / PAGE, me.index);
 	if (gone.va)
 		ungrant(gone.va, (gone.size + PAGE - 1) / PAGE, gone.index);
+	if (g)
+		gfd_release(g - 1, &gg);
 }
 
 /* close claimed buffer @b of session @sid on the host and forget it */
@@ -944,6 +1043,73 @@ static void pfd_put(int e)
 	pthread_mutex_unlock(&lock);
 }
 
+/*
+ * PRIME import of grant heap buffer ph->fd into session @sid: the back end
+ * imports its grants into that session once; a second import of the same
+ * buffer into the same session returns the same handle, as DRM does.
+ */
+static int gheap_import(int fd, uint32_t sid, struct drm_prime_handle *ph)
+{
+	struct buf *b = NULL;
+	uint32_t handle, npages = 0, *grefs = NULL;
+	uint64_t size = 0, index = 0;
+	void *va = NULL;
+	int i, ret;
+
+	pthread_mutex_lock(&lock);
+	if (!gfds[ph->fd].refs || gfds[ph->fd].held) {
+		/* closed since the caller looked */
+		pthread_mutex_unlock(&lock);
+		return -EBADF;
+	}
+	for (i = 0; i < MAX_BUF; i++)
+		if (bufs[i].handle && bufs[i].fd == fd && bufs[i].gfd == ph->fd + 1 &&
+		    !bufs[i].dying) {
+			bufs[i].pooled = 0;
+			bufs[i].closing = 0;
+			ph->handle = bufs[i].handle;
+			pthread_mutex_unlock(&lock);
+			return 0;
+		}
+	for (i = 0; i < MAX_BUF; i++)
+		if (!bufs[i].handle && !bufs[i].va) {
+			b = &bufs[i];
+			b->va = (void *)1;
+			break;
+		}
+	if (b) {
+		struct gfd *g = &gfds[ph->fd];
+
+		/* the reference and the entry's fields, before close() can move it */
+		g->refs++;
+		b->gfd = ph->fd + 1;
+		b->alias = 1;
+		grefs = g->grefs;
+		npages = g->npages;
+		size = g->size;
+		index = g->index;
+		va = g->va;
+	}
+	pthread_mutex_unlock(&lock);
+	if (!b)
+		return -ENOMEM;
+	ret = host_gem(sid, grefs, npages, size, &handle);
+	if (ret) {
+		drop_buf(b);
+		return ret;
+	}
+	pthread_mutex_lock(&lock);
+	b->handle = handle;
+	b->fd = fd;
+	b->size = size;
+	b->index = index;
+	b->va = va;
+	b->alias = 1;
+	pthread_mutex_unlock(&lock);
+	ph->handle = handle;
+	return 0;
+}
+
 /* close a handle of session @sid that nothing tracks */
 static void share_undo(uint32_t sid, uint32_t handle)
 {
@@ -991,6 +1157,8 @@ static int prime_to_handle(int fd, uint32_t sid, struct drm_prime_handle *ph)
 		}
 		return 0;
 	}
+	if (ph->fd >= 0 && ph->fd < MAX_FD && gfds[ph->fd].refs)
+		return gheap_import(fd, sid, ph);
 	if (ph->fd < 0 || ph->fd >= MAX_FD || !pfds[ph->fd].accel_fd)
 		return -EINVAL;	/* only buffers this library exported */
 	pthread_mutex_lock(&lock);
@@ -1031,7 +1199,7 @@ static int prime_to_handle(int fd, uint32_t sid, struct drm_prime_handle *ph)
 	 */
 	if (pfds[ph->fd].accel_fd != src_fd || pfds[ph->fd].buf != src ||
 	    src->dying || src->handle != was.handle || src->index != was.index ||
-	    src->size != was.size || src->va != was.va)
+	    src->size != was.size || src->gfd != was.gfd || src->va != was.va)
 		src = NULL;
 	if (!src) {
 		pthread_mutex_unlock(&lock);
@@ -1052,7 +1220,9 @@ static int prime_to_handle(int fd, uint32_t sid, struct drm_prime_handle *ph)
 		b->pooled = b->exported = b->pins = b->closing = 0;
 		b->users = 0;
 		/* the copy holds its own reference on the grants it maps */
-		if (!b->heap && !b->owner)
+		if (b->gfd)
+			gfds[b->gfd - 1].refs++;
+		else if (!b->heap && !b->owner)
 			b->owner = src;
 		if (b->owner)
 			b->owner->users++;
@@ -1079,10 +1249,12 @@ int ioctl(int fd, unsigned long req, ...)
 	arg = va_arg(ap, void *);
 	va_end(ap);
 	if (fd >= 0 && fd < MAX_FD && heap_dev[fd] && req == DMA_HEAP_IOCTL_ALLOC) {
-		ret = heap_alloc(arg);
+		ret = heap_dev[fd] == HEAP_DEV_GRANTS ? gheap_alloc(arg) : heap_alloc(arg);
 		goto out;
 	}
-	if (fd >= 0 && fd < MAX_FD && hfds[fd].used && req == DMA_BUF_IOCTL_SYNC)
+	if (fd >= 0 && fd < MAX_FD &&
+	    (hfds[fd].used || (gfds[fd].refs && !gfds[fd].held)) &&
+	    req == DMA_BUF_IOCTL_SYNC)
 		return 0;	/* cacheable memory, coherent banks */
 	if (fd < 0 || fd >= MAX_FD || !sid_of[fd])
 		return real_ioctl(fd, req, arg);
@@ -1217,6 +1389,14 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off)
 		}
 		return real_mmap(addr, len, prot, flags, shm, hfds[fd].off + off);
 	}
+	if (fd >= 0 && fd < MAX_FD && gfds[fd].refs && !gfds[fd].held) {
+		if (off < 0 || (off & (PAGE - 1)) ||
+		    (uint64_t)off + len > (uint64_t)gfds[fd].npages * PAGE) {
+			errno = EINVAL;
+			return MAP_FAILED;
+		}
+		return real_mmap(addr, len, prot, flags, gal, gfds[fd].index + off);
+	}
 	if (fd >= 0 && fd < MAX_FD && pfds[fd].accel_fd) {
 		memset(&p, 0, sizeof(p));
 		pthread_mutex_lock(&lock);
@@ -1257,6 +1437,51 @@ int close(int fd)
 		s.u.heap.bid = hfds[fd].bid;
 		hfds[fd].used = 0;
 		call(VQDA_OP_HEAP_FREE, 0, &s, sizeof(s), NULL);
+	}
+	if (fd >= 0 && fd < MAX_FD && gfds[fd].refs) {
+		struct gfd g = { 0 };
+		int keep = -1, stray, kept = 0;
+
+		/*
+		 * The caller's number is reused once closed: while imports
+		 * still use the buffer, its entry moves to a private number,
+		 * high so that the caller is unlikely to name it.
+		 */
+		if (gfds[fd].refs > 1)
+			keep = fcntl(fd, F_DUPFD_CLOEXEC, MAX_FD / 2);
+		if (keep >= MAX_FD) {
+			real_close(keep);
+			keep = -1;
+		}
+		pthread_mutex_lock(&lock);
+		stray = gfds[fd].held;
+		if (!stray && gfds[fd].refs > 1 && keep >= 0) {
+			gfds[keep] = gfds[fd];
+			gfds[keep].held = 1;
+			memset(&gfds[fd], 0, sizeof(gfds[fd]));
+			for (int i = 0; i < MAX_BUF; i++)
+				if (bufs[i].gfd == fd + 1)
+					bufs[i].gfd = keep + 1;
+			gfd_unref_locked(keep, &g);
+			keep = -1;
+		} else if (!stray && gfds[fd].refs > 1) {
+			/* no private number: the caller's stays open instead */
+			gfds[fd].held = 1;
+			gfd_unref_locked(fd, &g);
+			kept = 1;
+		} else if (!stray) {
+			gfd_unref_locked(fd, &g);
+		}
+		pthread_mutex_unlock(&lock);
+		if (keep >= 0)
+			real_close(keep);
+		if (stray) {
+			errno = EBADF;	/* closed already, held for imports */
+			return -1;
+		}
+		gfd_release(fd, &g);
+		if (kept)
+			return 0;
 	}
 	if (fd >= 0 && fd < MAX_FD)
 		heap_dev[fd] = 0;
