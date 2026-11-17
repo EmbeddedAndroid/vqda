@@ -1,0 +1,1 @@
+#define VQDA_BUILD_ID "@VCS_TAG@"

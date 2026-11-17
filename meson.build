@@ -22,3 +22,23 @@ threads = dependency('threads')
 
 test('xs', executable('test-xs', 'tests/test-xs.c',
   include_directories: inc, dependencies: threads))
+
+# vqda_build.h: VQDA_BUILD_ID, refreshed on every build from git describe
+build_id = vcs_tag(input: 'include/vqda_build.h.in', output: 'vqda_build.h',
+  command: ['git', '-C', meson.project_source_root(), 'describe',
+            '--always', '--dirty'],
+  fallback: meson.project_version())
+build_id_args = ['-include', 'vqda_build.h']
+# sanitizer runtimes do not link statically
+static_args = (get_option('static') and get_option('b_sanitize') == 'none'
+  ? ['-static'] : [])
+
+executable('vqda-back', 'src/vqda-back.c', build_id,
+  include_directories: inc, dependencies: threads, c_args: build_id_args,
+  link_args: static_args,
+  install: true)
+
+test('back', executable('test-back', 'tests/test-back.c',
+  include_directories: inc, dependencies: threads), timeout: 300,
+  env: {'TSAN_OPTIONS': 'suppressions=' + meson.project_source_root()
+                        / 'tests/tsan.supp'})

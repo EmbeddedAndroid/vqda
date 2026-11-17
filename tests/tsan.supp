@@ -1,0 +1,3 @@
+# The ring is guest memory: the back end copies a slot while the guest may
+# rewrite it, by design (copy_from_guest in src/vqda-back.c).
+race:copy_from_guest

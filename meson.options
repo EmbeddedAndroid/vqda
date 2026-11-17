@@ -1,0 +1,2 @@
+option('static', type: 'boolean', value: true,
+  description: 'Link vqda-back and vqda-bulk statically, for minimal root file systems')
