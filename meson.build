@@ -12,3 +12,8 @@ if get_option('optimization') not in ['0', 'g']
   add_project_arguments('-U_FORTIFY_SOURCE', '-D_FORTIFY_SOURCE=2',
     language: 'c')
 endif
+
+inc = include_directories('include')
+
+test('proto', executable('test-proto', 'tests/test-proto.c',
+  include_directories: inc))
