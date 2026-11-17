@@ -56,3 +56,8 @@ if get_option('b_sanitize') != 'thread'
   test('life', executable('test-life', 'tests/test-life.c',
     include_directories: inc, dependencies: [threads, dl]))
 endif
+
+foreach t : ['vqda-ping', 'vqda-neg', 'vqda-fuzz']
+  executable(t, 'tools/' + t + '.c', include_directories: inc,
+    link_with: libvqda, install: true)
+endforeach
