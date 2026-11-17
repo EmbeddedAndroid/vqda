@@ -17,3 +17,8 @@ inc = include_directories('include')
 
 test('proto', executable('test-proto', 'tests/test-proto.c',
   include_directories: inc))
+
+threads = dependency('threads')
+
+test('xs', executable('test-xs', 'tests/test-xs.c',
+  include_directories: inc, dependencies: threads))
