@@ -544,6 +544,14 @@ static void unmap_grants(void *va, uint32_t n, uint64_t index)
 	ioctl(gnt, IOCTL_GNTDEV_UNMAP_GRANT_REF, &u);
 }
 
+/* Which step of a buffer import failed: the guest only sees the errno. */
+static int gem_fail(const char *step, int ret, uint32_t npages)
+{
+	logrl("VQDABACK d%d gem_create %s: %d (%u pages)", domid, step, ret,
+	      npages);
+	return ret;
+}
+
 static int gem_create(struct session *s, struct vqda_slot *r)
 {
 	uint64_t size = r->u.gem.size, index = 0;
@@ -557,23 +565,23 @@ static int gem_create(struct session *s, struct vqda_slot *r)
 	if (!size || npages != (size + PAGE - 1) / PAGE || !nlist ||
 	    nlist > VQDA_MAX_LIST ||
 	    nlist != (npages + VQDA_REFS_PER_PAGE - 1) / VQDA_REFS_PER_PAGE)
-		return -EINVAL;
+		return gem_fail("size", -EINVAL, npages);
 	memcpy(lrefs, r->u.gem.list, nlist * sizeof(lrefs[0]));
 	if (client_gone())
 		return -ECONNRESET;
 	m = map_reserve(npages);
 	if (m < 0)
-		return m;
+		return gem_fail("budget", m, npages);
 	ret = map_grants(lrefs, nlist, PROT_READ, (void **)&list, &index);
 	if (ret) {
 		map_cancel(m);
-		return ret;
+		return gem_fail("list map", ret, npages);
 	}
 	x = calloc(1, sizeof(*x) + npages * sizeof(x->refs[0]));
 	if (!x) {
 		unmap_grants(list, nlist, index);
 		map_cancel(m);
-		return -ENOMEM;
+		return gem_fail("refs alloc", -ENOMEM, npages);
 	}
 	memcpy(x->refs, list, npages * sizeof(x->refs[0]));
 	unmap_grants(list, nlist, index);
@@ -588,7 +596,7 @@ static int gem_create(struct session *s, struct vqda_slot *r)
 		ret = -errno;
 		free(x);
 		map_cancel(m);
-		return ret;
+		return gem_fail("export", ret, npages);
 	}
 	ph.fd = x->fd;
 	free(x);
@@ -601,7 +609,7 @@ static int gem_create(struct session *s, struct vqda_slot *r)
 	pthread_mutex_unlock(&handle_lock);
 	close(ph.fd);
 	if (ret)
-		return ret;
+		return gem_fail("import", ret, npages);
 	r->u.gem.handle = ph.handle;
 	return 0;
 }
