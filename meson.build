@@ -42,3 +42,17 @@ test('back', executable('test-back', 'tests/test-back.c',
   include_directories: inc, dependencies: threads), timeout: 300,
   env: {'TSAN_OPTIONS': 'suppressions=' + meson.project_source_root()
                         / 'tests/tsan.supp'})
+
+dl = meson.get_compiler('c').find_library('dl')
+libvqda = shared_library('vqda', 'src/vqda-guest.c', build_id,
+  include_directories: inc, dependencies: [threads, dl],
+  c_args: build_id_args, install: true)
+
+test('guest', executable('test-guest', 'tests/test-guest.c',
+  include_directories: inc, link_with: libvqda))
+
+# TSan's own start-up maps memory through the mmap this test defines
+if get_option('b_sanitize') != 'thread'
+  test('life', executable('test-life', 'tests/test-life.c',
+    include_directories: inc, dependencies: [threads, dl]))
+endif
