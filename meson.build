@@ -61,3 +61,6 @@ foreach t : ['vqda-ping', 'vqda-neg', 'vqda-fuzz']
   executable(t, 'tools/' + t + '.c', include_directories: inc,
     link_with: libvqda, install: true)
 endforeach
+
+executable('vqda-bulk', 'tools/vqda-bulk.c', include_directories: inc,
+  link_args: static_args, install: true)
